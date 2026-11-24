@@ -390,9 +390,12 @@ function renderNodes(nodes, scope, templates, depth, out) {
       case 'text':
         out.push(n.text);
         break;
-      case 'var':
-        out.push(escapeHtml(textOf(lookup(scope, n.path))));
+      case 'var': {
+        const v = lookup(scope, n.path);
+        // Numbers and booleans render as digits/'true'/'false': no character in them ever needs escaping.
+        out.push(typeof v === 'number' || typeof v === 'boolean' ? String(v) : escapeHtml(textOf(v)));
         break;
+      }
       case 'raw':
         out.push(textOf(lookup(scope, n.path)));
         break;
@@ -491,8 +494,12 @@ function findSingleStar(s, from) {
  */
 /** Any character that can open inline markup or needs HTML escaping. One native regex scan instead of four indexOf calls per step. Shared with the recursive calls below; every exec is preceded by setting lastIndex, so the recursion cannot corrupt the scan. Because the scan stops at every escape character too, the plain runs between stops hold none of & < > " ', so they are pushed raw — escapeHtml is only still needed for code spans and link targets. */
 const SPECIAL_RE = /[\\`*[&<>"']/g;
+/** The characters that can open inline markup (no HTML escaping needed for the rest). A string with none of these renders as escapeHtml(s) alone — one native test instead of a per-character loop. */
+const MARKUP_TEST = /[`*\\[]/;
 
 function inline(s, env) {
+  // Fast path: no markup at all (the common case for prose) — escaping alone is the whole render.
+  if (!MARKUP_TEST.test(s)) return escapeHtml(s);
   const n = s.length;
   const out = [];
   let i = 0; // scan position: the next character not yet decided
@@ -500,7 +507,10 @@ function inline(s, env) {
   while (i < n) {
     SPECIAL_RE.lastIndex = i;
     const m = SPECIAL_RE.exec(s);
-    if (m === null) break; // no more markup: the plain run to the end is flushed below
+    if (m === null) {
+      if (out.length === 0) return s; // nothing consumed yet, so the whole string is plain: no slice, no join
+      break; // no more markup: the plain run to the end is flushed below
+    }
     const j = m.index;
     const c = s[j];
     const esc = ESCAPES[c];
@@ -717,9 +727,8 @@ function renderMarkdown(src, env) {
           const parts = ['<pre><code'];
           if (lang !== '') parts.push(` class="language-${escapeHtml(lang)}"`);
           parts.push('>');
-          for (const l of body) {
-            parts.push(escapeHtml(l), '\n');
-          }
+          // Escaping is per character, so one escape over the joined body is the per-line escapes joined.
+          if (body.length !== 0) parts.push(escapeHtml(body.join('\n')), '\n');
           parts.push('</code></pre>');
           out.push(parts.join(''));
           continue;
@@ -769,7 +778,10 @@ function renderMarkdown(src, env) {
       // A - or * line that is neither a break nor a list is a paragraph line.
     } else if (ch === '>') {
       const body = [];
-      while (i < n && lines[i][0] === '>') body.push(lines[i++].replace(/^> ?/, ''));
+      while (i < n && lines[i][0] === '>') {
+        const l = lines[i++];
+        body.push(l[1] === ' ' ? l.slice(2) : l.slice(1)); // /^> ?/ without the regex
+      }
       const kept = [];
       for (const l of body) {
         const t = trimLine(l);
@@ -831,17 +843,31 @@ const REPORT_FILE = 'build-report.txt';
 /** The top-level directories the generator writes itself, which no page's slug at the root may take. */
 const RESERVED = ['posts', 'tags', 'page'];
 
-/** `rel` (a link's path, "/"-separated) from the directory `dir` of a source, or null when it climbs out of the root. */
+/** `rel` (a link's path, "/"-separated) from the directory `dir` of a source, or null when it climbs out of the root. Pure in (dir, rel): memoized, since the same links repeat across pages. */
+const resolveCache = new Map();
 function resolvePath(dir, rel) {
+  let byRel = resolveCache.get(dir);
+  if (byRel === undefined) {
+    byRel = new Map();
+    resolveCache.set(dir, byRel);
+  } else {
+    const hit = byRel.get(rel);
+    if (hit !== undefined) return hit;
+  }
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
     if (seg === '..') {
-      if (parts.length === 0) return null;
+      if (parts.length === 0) {
+        byRel.set(rel, null);
+        return null;
+      }
       parts.pop();
     } else parts.push(seg);
   }
-  return parts.join('/');
+  const out = parts.join('/');
+  byRel.set(rel, out);
+  return out;
 }
 
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
@@ -859,7 +885,7 @@ function cardOf(s) {
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    tags: s.tagRefs.map((t) => t.card ?? { name: t.name, slug: t.slug, url: t.url }),
   };
 }
 
@@ -876,7 +902,7 @@ function pageOf(s, card) {
     tags: card.tags,
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    toc: s.toc,
     newer: linkOf(s.newer ?? null),
     older: linkOf(s.older ?? null),
     is_post: s.post,
@@ -1003,7 +1029,7 @@ export function build(input) {
     p.tagRefs = [];
     for (const name of ownTags(p)) {
       const slug = slugify(name);
-      if (!bySlug.has(slug)) bySlug.set(slug, { name, slug, url: `${base}/tags/${slug}/`, posts: [] });
+      if (!bySlug.has(slug)) bySlug.set(slug, { name, slug, url: `${base}/tags/${slug}/`, posts: [], card: { name, slug, url: `${base}/tags/${slug}/` } });
       const tag = bySlug.get(slug);
       tag.posts.push(p);
       p.tagRefs.push(tag);
