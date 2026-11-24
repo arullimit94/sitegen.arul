@@ -188,40 +188,62 @@ function rtrimSpaces(s) {
  * line ends.
  */
 function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') {
-      close = i;
+  const firstEnd = text.indexOf('\n');
+  if ((firstEnd === -1 ? text : text.slice(0, firstEnd)) !== '---') return { error: 'no front matter' };
+  // The closing '---' line, by offsets: no split of the whole text, and the body below is a slice, not a re-join.
+  let pos = firstEnd === -1 ? text.length : firstEnd + 1;
+  let closeStart = -1;
+  let closeEnd = -1;
+  while (pos < text.length) {
+    const nl = text.indexOf('\n', pos);
+    const end = nl === -1 ? text.length : nl;
+    if (text.slice(pos, end) === '---') {
+      closeStart = pos;
+      closeEnd = end;
       break;
     }
+    if (nl === -1) break;
+    pos = nl + 1;
   }
-  if (close === -1) return { error: 'the front matter is not closed' };
+  if (closeStart === -1) return { error: 'the front matter is not closed' };
   const data = {};
-  for (let i = 1; i < close; i++) {
-    const line = lines[i];
-    if (line === '' || line[0] === '#') continue;
-    if (line[0] === ' ' || line[0] === '\t') {
-      let blank = true;
-      for (let k = 0; k < line.length; k++) {
-        if (line[k] !== ' ' && line[k] !== '\t') { blank = false; break; }
+  let ln = 1;
+  pos = firstEnd === -1 ? text.length : firstEnd + 1;
+  while (pos < closeStart) {
+    const nl = text.indexOf('\n', pos);
+    const end = nl === -1 ? text.length : nl;
+    const line = text.slice(pos, end);
+    if (line !== '' && line[0] !== '#') {
+      let skip = false;
+      if (line[0] === ' ' || line[0] === '\t') {
+        let blank = true;
+        for (let k = 0; k < line.length; k++) {
+          if (line[k] !== ' ' && line[k] !== '\t') {
+            blank = false;
+            break;
+          }
+        }
+        if (blank) skip = true;
       }
-      if (blank) continue;
+      if (!skip) {
+        const m = fmLine(line);
+        if (m === null) return { error: `line ${ln + 1} is not "key: value"` };
+        const key = m.key;
+        const raw = rtrimSpaces(m.raw);
+        if (!KEYS.includes(key)) return { error: `unknown key "${key}"` };
+        if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
+        if (raw === '') return { error: `key "${key}" has no value` };
+        const v = valueOf(key, raw);
+        if ('error' in v) return v;
+        data[key] = v.value;
+      }
     }
-    const m = fmLine(line);
-    if (m === null) return { error: `line ${i + 1} is not "key: value"` };
-    const key = m.key;
-    const raw = rtrimSpaces(m.raw);
-    if (!KEYS.includes(key)) return { error: `unknown key "${key}"` };
-    if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
-    if (raw === '') return { error: `key "${key}" has no value` };
-    const v = valueOf(key, raw);
-    if ('error' in v) return v;
-    data[key] = v.value;
+    ln++;
+    if (nl === -1) break;
+    pos = nl + 1;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  return { data, body: closeEnd === text.length ? '' : text.slice(closeEnd + 1) };
 }
 
 // ---------------------------------------------------------------- templates
@@ -383,8 +405,17 @@ function renderNodes(nodes, scope, templates, depth, out) {
       case 'for': {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
+        // One scope and one loop record for the whole loop, mutated per item: the render is synchronous, so no
+        // iteration can observe another's values. The old code allocated both per item.
+        const vars = { [n.name]: undefined, loop: { index: 0, first: false, last: false, length: xs.length } };
+        const child = { vars, parent: scope };
+        const loop = vars.loop;
         for (let k = 0; k < xs.length; k++) {
-          renderNodes(n.body, { vars: { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } }, parent: scope }, templates, depth, out);
+          vars[n.name] = xs[k];
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === xs.length - 1;
+          renderNodes(n.body, child, templates, depth, out);
         }
         break;
       }
@@ -413,29 +444,38 @@ const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-
 const WS_TEST = /\s/;
 const CONTINUED = /^ {2,}\S/;
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
+/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. Found with indexOf (native) instead of a per-character scan: a run of backslashes right before the hit escapes it exactly when its length is odd. */
 function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
+  let j = s.indexOf(what, from);
+  while (j !== -1) {
+    let k = j - 1;
+    let bs = 0;
+    while (k >= 0 && s[k] === '\\') {
+      bs++;
+      k--;
     }
-    if (s.startsWith(what, j)) return j;
+    if (bs % 2 === 0) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
+/** The first single * from `from` (one whose run is not **), outside an escape, or -1. Same indexOf trick as findUnescaped. */
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
+  let j = s.indexOf('*', from);
+  while (j !== -1) {
+    let k = j - 1;
+    let bs = 0;
+    while (k >= 0 && s[k] === '\\') {
+      bs++;
+      k--;
+    }
+    if (bs % 2 === 1) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== '*') continue;
     if (s[j + 1] === '*') {
-      j++;
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
@@ -449,27 +489,32 @@ function findSingleStar(s, from) {
  * speed) and escapes the plain runs between them in bulk, instead of the
  * reference's per-character escapeHtml call.
  */
+/** Any character that can open inline markup or needs HTML escaping. One native regex scan instead of four indexOf calls per step. Shared with the recursive calls below; every exec is preceded by setting lastIndex, so the recursion cannot corrupt the scan. Because the scan stops at every escape character too, the plain runs between stops hold none of & < > " ', so they are pushed raw — escapeHtml is only still needed for code spans and link targets. */
+const SPECIAL_RE = /[\\`*[&<>"']/g;
+
 function inline(s, env) {
   const n = s.length;
   const out = [];
   let i = 0; // scan position: the next character not yet decided
   let plain = 0; // start of the pending plain run (literal characters so far, escaped in bulk)
   while (i < n) {
-    let j = n;
-    let k = s.indexOf('\\', i);
-    if (k !== -1 && k < j) j = k;
-    k = s.indexOf('`', i);
-    if (k !== -1 && k < j) j = k;
-    k = s.indexOf('*', i);
-    if (k !== -1 && k < j) j = k;
-    k = s.indexOf('[', i);
-    if (k !== -1 && k < j) j = k;
-    if (j === n) break; // no more markup: the plain run to the end is flushed below
+    SPECIAL_RE.lastIndex = i;
+    const m = SPECIAL_RE.exec(s);
+    if (m === null) break; // no more markup: the plain run to the end is flushed below
+    const j = m.index;
     const c = s[j];
+    const esc = ESCAPES[c];
+    if (esc !== undefined) {
+      if (j > plain) out.push(s.slice(plain, j));
+      out.push(esc);
+      i = j + 1;
+      plain = i;
+      continue;
+    }
     if (c === '\\') {
       const d = s[j + 1];
       if (j + 1 < n && ESCAPABLE.has(d)) {
-        if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
+        if (j > plain) out.push(s.slice(plain, j));
         out.push(d); // no escapable character is one of & < > " ', so escapeHtml(d) is d itself
         i = j + 2;
         plain = i;
@@ -481,7 +526,7 @@ function inline(s, env) {
     if (c === '`') {
       const m = s.indexOf('`', j + 1);
       if (m > j + 1) {
-        if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
+        if (j > plain) out.push(s.slice(plain, j));
         out.push('<code>', escapeHtml(s.slice(j + 1, m)), '</code>');
         i = m + 1;
         plain = i;
@@ -494,7 +539,7 @@ function inline(s, env) {
       if (s[j + 1] === '*') {
         const m = findUnescaped(s, '**', j + 2);
         if (m > j + 2) {
-          if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
+          if (j > plain) out.push(s.slice(plain, j));
           out.push('<strong>', inline(s.slice(j + 2, m), env), '</strong>');
           i = m + 2;
           plain = i;
@@ -505,7 +550,7 @@ function inline(s, env) {
       }
       const m = findSingleStar(s, j + 1);
       if (m > j + 1) {
-        if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
+        if (j > plain) out.push(s.slice(plain, j));
         out.push('<em>', inline(s.slice(j + 1, m), env), '</em>');
         i = m + 1;
         plain = i;
@@ -519,7 +564,7 @@ function inline(s, env) {
     const paren = close !== -1 && s[close + 1] === '(' ? s.indexOf(')', close + 2) : -1;
     const target = paren === -1 ? '' : s.slice(close + 2, paren);
     if (target !== '' && !WS_TEST.test(target)) {
-      if (j > plain) out.push(escapeHtml(s.slice(plain, j)));
+      if (j > plain) out.push(s.slice(plain, j));
       out.push('<a href="', escapeHtml(env.link(target)), '">', inline(s.slice(j + 1, close), env), '</a>');
       i = paren + 1;
       plain = i;
@@ -527,7 +572,7 @@ function inline(s, env) {
     }
     i = j + 1; // a [ that opens no link is itself
   }
-  if (plain < n) out.push(escapeHtml(s.slice(plain, n)));
+  if (plain < n) out.push(s.slice(plain, n));
   return out.join('');
 }
 
@@ -669,15 +714,14 @@ function renderMarkdown(src, env) {
           const body = [];
           while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
           if (i < n) i++;
-          let code = '<pre><code';
-          if (lang !== '') code += ` class="language-${escapeHtml(lang)}"`;
-          code += '>';
+          const parts = ['<pre><code'];
+          if (lang !== '') parts.push(` class="language-${escapeHtml(lang)}"`);
+          parts.push('>');
           for (const l of body) {
-            code += escapeHtml(l);
-            code += '\n';
+            parts.push(escapeHtml(l), '\n');
           }
-          code += '</code></pre>';
-          out.push(code);
+          parts.push('</code></pre>');
+          out.push(parts.join(''));
           continue;
         }
       }
@@ -717,7 +761,7 @@ function renderMarkdown(src, env) {
         const tag = isOrdered ? 'ol' : 'ul';
         const open = isOrdered && ls.start !== 1 ? `<ol start="${ls.start}">` : `<${tag}>`;
         let s = `${open}\n`;
-        for (const parts of items) s += `<li>${inline(parts.join('\n'), env)}</li>\n`;
+        for (const parts of items) s += `<li>${inline(parts.length === 1 ? parts[0] : parts.join('\n'), env)}</li>\n`;
         s += `</${tag}>`;
         out.push(s);
         continue;
@@ -731,7 +775,7 @@ function renderMarkdown(src, env) {
         const t = trimLine(l);
         if (t !== '') kept.push(t);
       }
-      out.push(kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(kept.join('\n'), env)}</p>\n</blockquote>`);
+      out.push(kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(kept.length === 1 ? kept[0] : kept.join('\n'), env)}</p>\n</blockquote>`);
       continue;
     } else if (ch >= '0' && ch <= '9') {
       const ls = listStart(line);
@@ -749,7 +793,7 @@ function renderMarkdown(src, env) {
           } else break;
         }
         let s = ls.start !== 1 ? `<ol start="${ls.start}">\n` : '<ol>\n';
-        for (const parts of items) s += `<li>${inline(parts.join('\n'), env)}</li>\n`;
+        for (const parts of items) s += `<li>${inline(parts.length === 1 ? parts[0] : parts.join('\n'), env)}</li>\n`;
         s += '</ol>';
         out.push(s);
         continue;
@@ -772,7 +816,7 @@ function renderMarkdown(src, env) {
       body.push(trimLine(l2));
       i++;
     }
-    const html = inline(body.join('\n'), env);
+    const html = inline(body.length === 1 ? body[0] : body.join('\n'), env);
     if (excerpt === null) excerpt = html;
     out.push(`<p>${html}</p>`);
   }
@@ -856,7 +900,7 @@ export function build(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else statics.push({ path: f.path, content: f.content });
   }
 
